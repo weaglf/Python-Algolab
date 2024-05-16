@@ -8,7 +8,7 @@ from config import MY_API_KEY, MY_PASSWORD, MY_USERNAME
 from ws import AlgoLabSocket
 
 
-def trailing_stop_loss(symbol):
+def trailing_stop_loss(symbol,purchase_amount):
     soket = AlgoLabSocket(algo.api_key, algo.hash, "T")
     soket.connect()
     while not soket.connected:
@@ -17,19 +17,20 @@ def trailing_stop_loss(symbol):
     data = {"Type": "T", "Symbols": [symbol]}
     soket.send(data)
 
-    percent = 0.003
-    money = 80000
-
-    top_price = 0
-    sold = False
+    STOP_LOSS_PERCENT = 0.0035
+    purchaseAmount = float(purchase_amount)
+    
     buyStarted = False
     buyFinished = False
+    soldStarted = False
+    soldFinished = False
+    top_price = 0
     buyLot = 0
     sellLot = 0
-
     i = 0
     a = 0
-    while soket.connected and not sold:
+
+    while soket.connected and not soldFinished:
 
         data = soket.recv()
         i += 1
@@ -37,30 +38,34 @@ def trailing_stop_loss(symbol):
             try:
                 msg = json.loads(data)
                 
-                if(msg['Type'] == 'O'): print(msg)
-                elif not buyFinished and buyStarted: print("Waiting for buy")
+                if(msg['Type'] == 'O'): print(f"{symbol}: {msg}")
+                elif not buyFinished and buyStarted: print(f"{symbol}: Waiting for buy completion")
 
                 if (msg['Content']['Symbol'] == symbol):
-                    currentPrice = msg['Content']['Price']
+
+                    currentPrice = msg['Content']['Price']                    
                     if(msg['Type'] != 'O'): top_price = max(currentPrice,top_price)
-                    if buyFinished: print(f"{top_price} - {currentPrice} = {a}")
+                    
+                    if buyFinished: print(f"{symbol}: {top_price} - {currentPrice} = {a}")
+
                     if not buyStarted:
-                        buyLot = floor(money / currentPrice)
-                        #print(d.SendOrder(symbol = symbol, direction = "BUY", pricetype = "Market", lot = lot, price=0.0, sms=True, email=False, subAccount=""))
-                        print(algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'piyasa', price='', lot=str(buyLot) ,sms=False,email=False,subAccount=""))
+                        buyLot = floor(purchaseAmount / currentPrice)
+                        print(f"{symbol}: Buying")
+                        print(algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'piyasa', price='', lot=str(buyLot) ,sms=False, email=False, subAccount=""))
                         buyStarted = True
-                    elif msg['Type'] == 'O' and msg['Content']['Direction'] == 0:
+                    elif msg['Type'] == 'O' and msg['Content']['Direction'] == 0 and msg['Content']['Status'] == 2:
                         sellLot += msg['Content']['Lot']
-                        print(sellLot)
                         buyFinished = True
-                    elif buyFinished and not sold:
-                        #print(d.SendOrder(symbol = symbol, direction = "SELL", pricetype = "Market", lot = lot, price=0.0, sms=True, email=False, subAccount=""))
-                        sellCondition = (currentPrice < top_price*(1-percent))
-                        if sellCondition:
+                    elif msg['Type'] == 'O' and msg['Content']['Direction'] == 1:
+                        soldFinished = True
+                    elif buyFinished and not soldStarted:
+                        willSell = (currentPrice < top_price*(1-STOP_LOSS_PERCENT))
+                        if willSell:
                             a += 1
-                            if (a == 3):
-                                print(algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'piyasa', price='', lot=str(sellLot) ,sms=False,email=False,subAccount=""))
-                                sold = True
+                            if (a == 5):
+                                print(f"{symbol}: Selling")
+                                print(algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'piyasa', price='', lot=str(sellLot) ,sms=False, email=False, subAccount=""))
+                                soldStarted = True
                         else:
                             a = 0
 
@@ -69,10 +74,9 @@ def trailing_stop_loss(symbol):
                 break
     
     soket.close()
-
+    print(f"{symbol}: closed!")
 
 def start_server(host='localhost', port=12345):
-
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind((host, port))
     server_socket.listen(5)
@@ -88,9 +92,10 @@ def start_server(host='localhost', port=12345):
                     data = client_socket.recv(1024)
                     if not data:
                         break
-                    print(f"Received: {data.decode()}")
-                    symbol = data.decode()
-                    trail = Thread(target = trailing_stop_loss, args = (symbol,))
+                    decoded_message = data.decode()
+                    print(f"Received: {decoded_message}")
+                    stockCode, purchaseAmount = decoded_message.split(':')
+                    trail = Thread(target = trailing_stop_loss, args = (stockCode,purchaseAmount,))
                     trail.start()
             finally:
                 client_socket.close()
@@ -99,5 +104,5 @@ def start_server(host='localhost', port=12345):
     finally:
         server_socket.close()
 
-algo = API(api_key=MY_API_KEY, username=MY_USERNAME, password=MY_PASSWORD, auto_login=True, verbose=True)
+algo = API(api_key=MY_API_KEY, username=MY_USERNAME, password=MY_PASSWORD, auto_login=True, keep_alive=True, verbose=True)
 start_server()
