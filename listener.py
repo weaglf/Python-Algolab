@@ -6,7 +6,58 @@ import time
 from algolab import API
 from config import MY_API_KEY, MY_PASSWORD, MY_USERNAME
 from ws import AlgoLabSocket
+import re
 
+def custom_round(value):
+    # Determine the rounding step based on the value's size
+    if value > 2500:
+        step = 2.50
+    elif value > 1000:
+        step = 1.00
+    elif value > 500:
+        step = 0.50
+    elif value > 250:
+        step = 0.25
+    elif value > 100:
+        step = 0.10
+    elif value > 50:
+        step = 0.05
+    elif value > 20:
+        step = 0.02
+    elif value > 0:
+        step = 0.01
+    else:
+        return 0.00  # If the value is not greater than 0, return 0.00
+    
+    # Calculate the nearest multiple of step that is greater than or equal to the value
+    rounded_value = (value // step) * step
+    if value % step != 0:
+        rounded_value += step
+
+    # Return the value rounded to two decimal places
+    return round(rounded_value, 2)
+
+def getTotalStockAmount(symbol):
+    totalStock = '0'
+    data = algo.GetInstantPosition()
+    for item in data['content']:
+        if item['code'] == symbol:
+            totalStock = item['totalstock']
+            break
+    return float(totalStock)
+
+def extract_reference_number(data):
+    # Extracting the content string
+    content = data.get('content', '')
+    
+    # Using regex to find the reference number
+    match = re.search(r'Referans Numaranız: (\w+);', content)
+    
+    # Extracting the reference number if it matches
+    if match:
+        return match.group(1)
+    else:
+        return None
 
 def trailing_stop_loss(symbol,purchase_amount):
     soket = AlgoLabSocket(algo.api_key, algo.hash, "T")
@@ -17,62 +68,104 @@ def trailing_stop_loss(symbol,purchase_amount):
     data = {"Type": "T", "Symbols": [symbol]}
     soket.send(data)
 
+    BUY_SLIPPAGE = 1.005
     STOP_LOSS_PERCENT = 0.0035
+    SELL_INACTIVITY_DURATION = 10
+
     purchaseAmount = float(purchase_amount)
-    
     buyStarted = False
     buyFinished = False
     soldStarted = False
     soldFinished = False
-    top_price = 0
+    buyId = ""
+    sellId = ""
+    topPrice = 0
+    startingPrice = 0
     buyLot = 0
     sellLot = 0
     i = 0
-    a = 0
+    sellIteration = 0
+    buyTime = time.time()
+    price_list = []
 
-    while soket.connected and not soldFinished:
-
+    while soket.connected and (not soldFinished or time.time() - buyTime < 300):
         data = soket.recv()
         i += 1
         if data:
             try:
                 msg = json.loads(data)
-                
-                if(msg['Type'] == 'O'): print(f"{symbol}: {msg}")
-                elif not buyFinished and buyStarted: print(f"{symbol}: Waiting for buy completion")
+                if msg['Type'] == "T": 
+                    price_list.append(msg['Content']['Price']) #ANALYSIS
+                if soldFinished: 
+                    continue #ANALYSIS
+
+                if(msg['Type'] == 'O'): 
+                    print(f"{symbol}: {msg}") #DEBUG
 
                 if (msg['Content']['Symbol'] == symbol):
-
-                    currentPrice = msg['Content']['Price']                    
-                    if(msg['Type'] != 'O'): top_price = max(currentPrice,top_price)
-                    
-                    if buyFinished: print(f"{symbol}: {top_price} - {currentPrice} = {a}")
+                    currentPrice = msg['Content']['Price']
 
                     if not buyStarted:
-                        buyLot = floor(purchaseAmount / currentPrice)
-                        print(f"{symbol}: Buying")
-                        print(algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'piyasa', price='', lot=str(buyLot) ,sms=False, email=False, subAccount=""))
+                        buyLot = floor(purchaseAmount / currentPrice) #BUY_CALCULATION
+                        maxPrice = custom_round(currentPrice*BUY_SLIPPAGE) #BUY_CALCULATION
+                        startingPrice = currentPrice
+                        print(f"{symbol}: Buying") #DEBUG
+                        price_list.append("BUY STARTED") #ANALYSIS
+                        buyJson = algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'limit', price=str(maxPrice), lot=str(buyLot) ,sms=False, email=False, subAccount="")
+                        buyId = extract_reference_number(buyJson)
+                        print(f"{buyJson} and {buyId}") #BUY
+                        
                         buyStarted = True
-                    elif msg['Type'] == 'O' and msg['Content']['Direction'] == 0 and msg['Content']['Status'] == 2:
-                        sellLot += msg['Content']['Lot']
-                        buyFinished = True
-                    elif msg['Type'] == 'O' and msg['Content']['Direction'] == 1:
-                        soldFinished = True
+                        buyTime = time.time() #ANALYSIS
+
+                    elif not buyFinished:
+                        print(f"{symbol}: Waiting for buy completion: {time.time() - buyTime}") #DEBUG
+
+                        if msg['Type'] == 'O' and msg['Content']['Direction'] == 0 and msg['Content']['Status'] == 2:
+                            sellLot = msg['Content']['Lot'] #SELL_CALCULATION
+                            buyFinished = True
+                            buyTime = time.time() #ANALYSIS
+                            price_list.append("BUY FINISHED") #ANALYSIS
+
+                        elif time.time() - buyTime > 5 and not buyFinished:
+                            sellLot = getTotalStockAmount(symbol)
+                            print(f"{symbol}: Total Lot= {sellLot}")
+                            buyFinished = True
+                            buyTime = time.time()
+                            price_list.append("BUY FORCE FINISHED") #ANALYSIS
+                            algo.DeleteOrder(buyId,"")
+
                     elif buyFinished and not soldStarted:
-                        willSell = (currentPrice < top_price*(1-STOP_LOSS_PERCENT))
-                        if willSell:
-                            a += 1
-                            if (a == 5):
-                                print(f"{symbol}: Selling")
-                                print(algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'piyasa', price='', lot=str(sellLot) ,sms=False, email=False, subAccount=""))
+                        if(msg['Type'] != 'O'): topPrice = max(currentPrice,topPrice) #SELL
+                        if buyFinished: print(f"{symbol}: {topPrice} - {currentPrice} = {sellIteration} : {time.time() - buyTime}") #DEBUG
+                        dropStarted = (currentPrice < topPrice*(1-STOP_LOSS_PERCENT)) #SELL_CALCULATION
+                        stockInactive = ((time.time() - buyTime > SELL_INACTIVITY_DURATION) and (currentPrice < startingPrice * 1.005)) #SELL_CALCULATION
+                        if dropStarted or stockInactive:
+                            sellIteration += 1 #SELL_CALCULATION
+                            if (sellIteration == 5 or stockInactive):
+                                print(f"{symbol}: Selling") #DEBUG
+                                sellJson = algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'piyasa', price='', lot=str(sellLot) ,sms=False, email=False, subAccount="")
+                                sellId = extract_reference_number(sellJson)
+                                print(f"{sellJson} and {sellId}") #BUY
+                                
                                 soldStarted = True
+                                price_list.append("SELL STARTED") #ANALYSIS
                         else:
-                            a = 0
+                            sellIteration = 0
+
+                    elif not soldFinished:
+                        if msg['Type'] == 'O' and msg['Content']['Direction'] == 1:
+                            soldFinished = True
+                            price_list.append("SELL FINISHED") #ANALYSIS
 
             except Exception as e:
                 print(e)
                 break
     
+    with open("analysis.txt", 'a') as file:
+        list_as_string = str(price_list)
+        file.write(list_as_string + '\n')
+
     soket.close()
     print(f"{symbol}: closed!")
 
