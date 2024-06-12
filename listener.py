@@ -8,8 +8,7 @@ from config import MY_API_KEY, MY_PASSWORD, MY_USERNAME
 from ws import AlgoLabSocket
 import re
 
-def custom_round(value):
-    # Determine the rounding step based on the value's size
+def step_calculator(value):
     if value > 2500:
         step = 2.50
     elif value > 1000:
@@ -27,8 +26,13 @@ def custom_round(value):
     elif value > 0:
         step = 0.01
     else:
-        return 0.00  # If the value is not greater than 0, return 0.00
-    
+        step = 0
+
+    return step
+
+def custom_round(value):
+    step = step_calculator(value)
+
     # Calculate the nearest multiple of step that is greater than or equal to the value
     rounded_value = (value // step) * step
     if value % step != 0:
@@ -60,6 +64,7 @@ def extract_reference_number(data):
         return None
 
 def trailing_stop_loss(symbol,purchase_amount):
+    print(f"{symbol}: {time.time()}")
     soket = AlgoLabSocket(algo.api_key, algo.hash, "T")
     soket.connect()
     while not soket.connected:
@@ -69,8 +74,8 @@ def trailing_stop_loss(symbol,purchase_amount):
     soket.send(data)
 
     BUY_SLIPPAGE = 1.005
-    STOP_LOSS_PERCENT = 0.0035
-    SELL_INACTIVITY_DURATION = 10
+    STOP_LOSS_PERCENT = 0.005
+    SELL_INACTIVITY_DURATION = 20
 
     purchaseAmount = float(purchase_amount)
     buyStarted = False
@@ -80,22 +85,27 @@ def trailing_stop_loss(symbol,purchase_amount):
     buyId = ""
     sellId = ""
     topPrice = 0
+    buyLimitPrice = 0
     startingPrice = 0
     buyLot = 0
     sellLot = 0
     i = 0
     sellIteration = 0
+    startTime = time.time()
     buyTime = time.time()
-    price_list = []
+    logs = []
+
+    print(f"{symbol}: {time.time()}")
 
     while soket.connected and (not soldFinished or time.time() - buyTime < 300):
         data = soket.recv()
         i += 1
+
         if data:
             try:
                 msg = json.loads(data)
                 if msg['Type'] == "T": 
-                    price_list.append(msg['Content']['Price']) #ANALYSIS
+                    if 'Date' in msg['Content']: logs.append(f"{msg['Content']['Date']}*{msg['Content']['Price']}") #ANALYSIS
                 if soldFinished: 
                     continue #ANALYSIS
 
@@ -104,14 +114,15 @@ def trailing_stop_loss(symbol,purchase_amount):
 
                 if (msg['Content']['Symbol'] == symbol):
                     currentPrice = msg['Content']['Price']
-
+    
                     if not buyStarted:
+                        print(time.time())
                         buyLot = floor(purchaseAmount / currentPrice) #BUY_CALCULATION
-                        maxPrice = custom_round(currentPrice*BUY_SLIPPAGE) #BUY_CALCULATION
+                        buyLimitPrice = custom_round(currentPrice*BUY_SLIPPAGE) #BUY_CALCULATION
                         startingPrice = currentPrice
                         print(f"{symbol}: Buying") #DEBUG
-                        price_list.append("BUY STARTED") #ANALYSIS
-                        buyJson = algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'limit', price=str(maxPrice), lot=str(buyLot) ,sms=False, email=False, subAccount="")
+                        logs.append("BUY STARTED") #ANALYSIS
+                        buyJson = algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'limit', price=str(buyLimitPrice), lot=str(buyLot) ,sms=False, email=False, subAccount="")
                         buyId = extract_reference_number(buyJson)
                         print(f"{buyJson} and {buyId}") #BUY
                         
@@ -125,14 +136,14 @@ def trailing_stop_loss(symbol,purchase_amount):
                             sellLot = msg['Content']['Lot'] #SELL_CALCULATION
                             buyFinished = True
                             buyTime = time.time() #ANALYSIS
-                            price_list.append("BUY FINISHED") #ANALYSIS
+                            logs.append("BUY FINISHED") #ANALYSIS
 
-                        elif time.time() - buyTime > 5 and not buyFinished:
+                        elif (time.time() - buyTime > 10 or currentPrice > buyLimitPrice) and not buyFinished:
                             sellLot = getTotalStockAmount(symbol)
                             print(f"{symbol}: Total Lot= {sellLot}")
                             buyFinished = True
                             buyTime = time.time()
-                            price_list.append("BUY FORCE FINISHED") #ANALYSIS
+                            logs.append("BUY FORCE FINISHED") #ANALYSIS
                             algo.DeleteOrder(buyId,"")
 
                     elif buyFinished and not soldStarted:
@@ -143,28 +154,33 @@ def trailing_stop_loss(symbol,purchase_amount):
                         if dropStarted or stockInactive:
                             sellIteration += 1 #SELL_CALCULATION
                             if (sellIteration == 5 or stockInactive):
+                                limitPrice = custom_round(currentPrice-(step_calculator(currentPrice)*2))
                                 print(f"{symbol}: Selling") #DEBUG
-                                sellJson = algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'piyasa', price='', lot=str(sellLot) ,sms=False, email=False, subAccount="")
+                                sellJson = algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'limit', price=str(limitPrice), lot=str(sellLot) ,sms=False, email=False, subAccount="")
                                 sellId = extract_reference_number(sellJson)
-                                print(f"{sellJson} and {sellId}") #BUY
-                                
+                                print(f"{sellJson} and {sellId} and {limitPrice}") #BUY
+
                                 soldStarted = True
-                                price_list.append("SELL STARTED") #ANALYSIS
+                                logs.append("SELL STARTED") #ANALYSIS
                         else:
                             sellIteration = 0
 
                     elif not soldFinished:
-                        if msg['Type'] == 'O' and msg['Content']['Direction'] == 1:
+                        if msg['Type'] == 'O' and msg['Content']['Direction'] == 1 and msg['Content']['Status'] == 2:
                             soldFinished = True
-                            price_list.append("SELL FINISHED") #ANALYSIS
+                            logs.append("SELL FINISHED") #ANALYSIS
+                        else:
+                            limitPrice = custom_round(currentPrice-(step_calculator(currentPrice)*2))
+                            print(algo.ModifyOrder(sellId,str(limitPrice),"",False,""))
+                        
 
             except Exception as e:
                 print(e)
                 break
     
     with open("analysis.txt", 'a') as file:
-        list_as_string = str(price_list)
-        file.write(list_as_string + '\n')
+        list_as_string = str(logs)
+        file.write(f"{symbol} - {startTime}: {list_as_string}\n")
 
     soket.close()
     print(f"{symbol}: closed!")
