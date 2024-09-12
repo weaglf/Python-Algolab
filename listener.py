@@ -63,7 +63,7 @@ def extract_reference_number(data):
     else:
         return None
 
-def trailing_stop_loss(symbol,purchase_amount):
+def trailing_stop_loss(symbol,purchase_amount,sell_slippage):
     print(f"{symbol}: {time.time()}")
     soket = AlgoLabSocket(algo.api_key, algo.hash, "T")
     soket.connect()
@@ -74,23 +74,24 @@ def trailing_stop_loss(symbol,purchase_amount):
     soket.send(data)
 
     BUY_SLIPPAGE = 1.005
-    STOP_LOSS_PERCENT = 0.005
-    SELL_INACTIVITY_DURATION = 20
+    STOP_LOSS_PERCENT = 0.003
+    SELL_INACTIVITY_DURATION = 120
 
     purchaseAmount = float(purchase_amount)
+    sellSlippage = float(sell_slippage)
+    sellPrice = 0
+    stopLossPrice = 0
     buyStarted = False
     buyFinished = False
     soldStarted = False
     soldFinished = False
     buyId = ""
     sellId = ""
-    topPrice = 0
     buyLimitPrice = 0
     startingPrice = 0
     buyLot = 0
     sellLot = 0
     i = 0
-    sellIteration = 0
     startTime = time.time()
     buyTime = time.time()
     logs = []
@@ -117,15 +118,17 @@ def trailing_stop_loss(symbol,purchase_amount):
     
                     if not buyStarted:
                         print(time.time())
-                        buyLot = floor(purchaseAmount / currentPrice) #BUY_CALCULATION
+                        buyLot = floor((purchaseAmount / 2) / currentPrice) #BUY_CALCULATION
                         buyLimitPrice = custom_round(currentPrice*BUY_SLIPPAGE) #BUY_CALCULATION
+                        sellPrice = custom_round(currentPrice*sellSlippage) #BUY_CALCULATION
+                        print(sellPrice)
                         startingPrice = currentPrice
                         print(f"{symbol}: Buying") #DEBUG
                         logs.append("BUY STARTED") #ANALYSIS
                         buyJson = algo.SendOrder(symbol=symbol, direction= 'Buy', pricetype= 'limit', price=str(buyLimitPrice), lot=str(buyLot) ,sms=False, email=False, subAccount="")
                         buyId = extract_reference_number(buyJson)
                         print(f"{buyJson} and {buyId}") #BUY
-                        
+                        stopLossPrice = currentPrice * (1-STOP_LOSS_PERCENT)
                         buyStarted = True
                         buyTime = time.time() #ANALYSIS
 
@@ -145,32 +148,27 @@ def trailing_stop_loss(symbol,purchase_amount):
                             buyTime = time.time()
                             logs.append("BUY FORCE FINISHED") #ANALYSIS
                             algo.DeleteOrder(buyId,"")
+                            soldFinished = sellLot == 0
 
                     elif buyFinished and not soldStarted:
-                        if(msg['Type'] != 'O'): topPrice = max(currentPrice,topPrice) #SELL
-                        if buyFinished: print(f"{symbol}: {topPrice} - {currentPrice} = {sellIteration} : {time.time() - buyTime}") #DEBUG
-                        dropStarted = (currentPrice < topPrice*(1-STOP_LOSS_PERCENT)) #SELL_CALCULATION
-                        stockInactive = ((time.time() - buyTime > SELL_INACTIVITY_DURATION) and (currentPrice < startingPrice * 1.005)) #SELL_CALCULATION
-                        if dropStarted or stockInactive:
-                            sellIteration += 1 #SELL_CALCULATION
-                            if (sellIteration == 5 or stockInactive):
-                                limitPrice = custom_round(currentPrice-(step_calculator(currentPrice)*2))
-                                print(f"{symbol}: Selling") #DEBUG
-                                sellJson = algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'limit', price=str(limitPrice), lot=str(sellLot) ,sms=False, email=False, subAccount="")
-                                sellId = extract_reference_number(sellJson)
-                                print(f"{sellJson} and {sellId} and {limitPrice}") #BUY
 
-                                soldStarted = True
-                                logs.append("SELL STARTED") #ANALYSIS
-                        else:
-                            sellIteration = 0
+                        print(f"{symbol}: Selling") #DEBUG
+                        sellJson = algo.SendOrder(symbol=symbol, direction= 'Sell', pricetype= 'limit', price=str(sellPrice), lot=str(sellLot) ,sms=False, email=False, subAccount="")
+                        sellId = extract_reference_number(sellJson)
+                        soldStarted = True
+                        logs.append("SELL STARTED") #ANALYSIS
 
                     elif not soldFinished:
+                        if buyFinished: print(f"{symbol}:  {currentPrice} = {time.time() - buyTime}") #DEBUG
+                        stockInactive = ((time.time() - buyTime > SELL_INACTIVITY_DURATION) and (currentPrice < startingPrice * 1.005)) #SELL_CALCULATION
+                        stopLoss = currentPrice < stopLossPrice #SELL_CALCULATION
+
                         if msg['Type'] == 'O' and msg['Content']['Direction'] == 1 and msg['Content']['Status'] == 2:
                             soldFinished = True
                             logs.append("SELL FINISHED") #ANALYSIS
-                        else:
+                        elif stockInactive or stopLoss:
                             limitPrice = custom_round(currentPrice-(step_calculator(currentPrice)*2))
+                            print(f"{symbol}: Inactive Selling") #DEBUG
                             print(algo.ModifyOrder(sellId,str(limitPrice),"",False,""))
                         
 
@@ -203,8 +201,11 @@ def start_server(host='localhost', port=12345):
                         break
                     decoded_message = data.decode()
                     print(f"Received: {decoded_message}")
-                    stockCode, purchaseAmount = decoded_message.split(':')
-                    trail = Thread(target = trailing_stop_loss, args = (stockCode,purchaseAmount,))
+                    parts = decoded_message.split(':')
+                    stockCode = parts[0] if len(parts) > 0 else "ABCDE"
+                    purchaseAmount = parts[1] if len(parts) > 1 else "100"
+                    sell_slippage = parts[2] if len(parts) > 2 else "1.01"
+                    trail = Thread(target = trailing_stop_loss, args = (stockCode,purchaseAmount,sell_slippage,))
                     trail.start()
             finally:
                 client_socket.close()
